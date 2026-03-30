@@ -1,0 +1,1672 @@
+import sys
+from datetime import date
+from pathlib import Path
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+    QPushButton, QLabel, QComboBox, QLineEdit, QTableWidget,
+    QTableWidgetItem, QHeaderView, QStatusBar, QMessageBox,
+    QDialog, QTextEdit, QSizePolicy, QFrame, QCheckBox,
+    QProgressDialog, QMenu, QApplication, QScrollArea, QFileDialog,
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize
+from PyQt6.QtGui import QAction, QFont, QColor, QIcon, QPixmap
+
+from core.database import (
+    get_fees, get_selected_states, get_available_years, get_import_log,
+    get_preference, set_preference, get_selected_years, save_selected_years,
+    is_rural_zip, get_current_year_or_fallback,
+)
+from core.cms_downloader import download_cms_fees, SUPPORTED_YEARS
+from core.pfs_downloader import download_pfs_fees
+from core.pfs_downloader import SUPPORTED_YEARS as PFS_SUPPORTED_YEARS
+from core.database import (
+    get_pfs_fees, get_available_pfs_years, get_current_pfs_year_or_fallback,
+)
+from ui.import_dialog import ImportDialog
+from ui.export_dialog import ExportDialog
+from ui.state_selector_dialog import StateSelectorDialog
+from ui.year_selector_dialog import YearSelectorDialog
+
+# Column definitions for Physician Fee Schedule table
+_PFS_COLUMNS = [
+    "hcpcs_code", "description", "payment_non_facility",
+    "payment_facility", "year", "data_source",
+]
+_PFS_COLUMN_HEADERS = [
+    "HCPCS Code", "Description", "Non-Facility ($)", "Facility ($)", "Year", "Source",
+]
+
+
+def _asset(name: str) -> Path:
+    """Return the absolute path to *name* inside the ``assets/`` folder.
+
+    Works in both development mode and when frozen by PyInstaller.
+    """
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent))
+    return base / "assets" / name
+
+
+class SyncWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, years, states):
+        super().__init__()
+        self.years = years
+        self.states = states
+
+    def run(self):
+        try:
+            total = 0
+            for year in self.years:
+                count = download_cms_fees(
+                    year,
+                    self.states,
+                    progress_callback=lambda msg: self.progress.emit(msg),
+                )
+                total += count
+            self.finished.emit(total)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PfsSyncWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, years):
+        super().__init__()
+        self.years = years
+
+    def run(self):
+        try:
+            total = 0
+            for year in self.years:
+                count = download_pfs_fees(
+                    year,
+                    progress_callback=lambda msg: self.progress.emit(msg),
+                )
+                total += count
+            self.finished.emit(total)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, splash=None):
+        super().__init__()
+        self._splash = splash
+        self.setWindowTitle("VA HCPCS Fee Schedule Manager")
+        self.setMinimumSize(1200, 700)
+        # Set the window / taskbar icon from the assets folder.
+        icon_path = _asset("wsnc_map.png")
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+        self._records = []
+        self._sync_worker = None
+        self._progress_dlg = None
+        # Debounce timer for live search (HCPCS + Keyword fields)
+        self._search_timer = QTimer()
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self._apply_filters)
+        self._splash_update(30, "Building user interface…")
+        self._init_ui()
+        self._init_menu()
+        self._splash_update(55, "Loading year and state filters…")
+        self._refresh_filters()
+        self._splash_update(70, "Restoring saved preferences…")
+        self._restore_filter_preferences()
+        self._splash_update(100, "Ready!")
+        self._set_status("Loading fee records…")
+        self._splash = None  # release; splash lifetime managed by main.py
+        # Defer the initial query so the window appears before the DB load runs.
+        # This prevents users from thinking the app has frozen during startup.
+        QTimer.singleShot(0, self._apply_filters)
+
+        # Background update check
+        self._update_worker = None
+        self._start_update_check()
+
+    # ------------------------------------------------------------------ UI --
+
+    def _splash_update(self, pct: int, message: str) -> None:
+        """Forward a progress update to the splash screen if one is attached."""
+        if self._splash is not None:
+            try:
+                self._splash.set_progress(pct, message)
+            except Exception:
+                pass  # Never let splash failures crash startup
+
+    def _init_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # ---- Update notification bar (hidden by default) ----
+        bar_style = (
+            "background-color: #FFF3CD;"
+            "border: 1px solid #FFECB5;"
+            "border-radius: 4px;"
+            "color: #664D03;"
+            "font-size: 12px;"
+        )
+        self._update_bar_widget = QWidget()
+        self._update_bar_widget.setStyleSheet(f"QWidget {{ {bar_style} }}")
+        update_bar_layout = QHBoxLayout(self._update_bar_widget)
+        update_bar_layout.setContentsMargins(12, 6, 12, 6)
+        update_bar_layout.setSpacing(10)
+
+        self.update_bar = QLabel()
+        self.update_bar.setOpenExternalLinks(True)
+        self.update_bar.setWordWrap(True)
+        self.update_bar.setStyleSheet("background: transparent; border: none;")
+        update_bar_layout.addWidget(self.update_bar, 1)
+
+        self._update_now_btn = QPushButton("⬇  Update Now")
+        self._update_now_btn.setStyleSheet(
+            "QPushButton {"
+            "  background-color: #0D6EFD; color: white;"
+            "  padding: 4px 12px; border-radius: 4px; font-size: 12px;"
+            "  border: none;"
+            "}"
+            "QPushButton:hover { background-color: #0B5ED7; }"
+        )
+        self._update_now_btn.setVisible(False)
+        self._update_now_btn.clicked.connect(self._on_update_now)
+        update_bar_layout.addWidget(self._update_now_btn)
+
+        self._update_bar_widget.hide()
+        root.addWidget(self._update_bar_widget)
+
+        # ---- Schedule Type selector ----
+        schedule_row = QHBoxLayout()
+        schedule_row.setSpacing(6)
+        schedule_row.addWidget(QLabel("Schedule Type:"))
+        self.schedule_combo = QComboBox()
+        self.schedule_combo.addItem("DMEPOS HCPCS Fee Schedule", "dmepos")
+        self.schedule_combo.addItem("Physician Fee Schedule (National)", "pfs")
+        self.schedule_combo.setMinimumWidth(280)
+        self.schedule_combo.currentIndexChanged.connect(self._on_schedule_type_changed)
+        schedule_row.addWidget(self.schedule_combo)
+        schedule_row.addStretch()
+        root.addLayout(schedule_row)
+
+        # ---- Toolbar (two rows) ----
+        toolbar_container = QVBoxLayout()
+        toolbar_container.setSpacing(4)
+
+        # ---- Row 1: Sync | Year | State | ZIP ----
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+
+        sync_btn = QPushButton("⚌  Sync from CMS")
+        sync_btn.setStyleSheet(
+            "background-color: #003366; color: white; padding: 6px 14px; font-weight: bold; font-size: 13px;"
+        )
+        sync_btn.setToolTip("Download latest CMS DMEPOS fee schedules for your tracked states")
+        sync_btn.clicked.connect(self._sync_cms)
+        row1.addWidget(sync_btn)
+
+        row1.addSpacing(12)
+
+        # Year filter
+        row1.addWidget(QLabel("Year:"))
+        self.year_combo = QComboBox()
+        self.year_combo.setMinimumWidth(90)
+        self.year_combo.currentIndexChanged.connect(self._on_year_changed)
+        row1.addWidget(self.year_combo)
+
+        # Label showing effective year (updated whenever year combo changes)
+        self.year_view_label = QLabel("")
+        self.year_view_label.setStyleSheet("color: #555555; font-style: italic; font-size: 11px;")
+        self.year_view_label.setMinimumWidth(160)
+        row1.addWidget(self.year_view_label)
+
+        row1.addSpacing(8)
+
+        # State filter
+        self._state_label = QLabel("State:")
+        row1.addWidget(self._state_label)
+        self.state_combo = QComboBox()
+        self.state_combo.setMinimumWidth(130)
+        self.state_combo.currentIndexChanged.connect(self._apply_filters)
+        self.state_combo.currentIndexChanged.connect(self._save_filter_preferences)
+        row1.addWidget(self.state_combo)
+
+        row1.addSpacing(8)
+
+        # ZIP code input for rural/non-rural determination
+        self._zip_label = QLabel("ZIP:")
+        row1.addWidget(self._zip_label)
+        self.zip_edit = QLineEdit()
+        self.zip_edit.setPlaceholderText("5-digit ZIP")
+        self.zip_edit.setMaximumWidth(80)
+        self.zip_edit.setToolTip(
+            "Enter a 5-digit ZIP code to automatically select rural (R) or non-rural (NR) allowable.\n"
+            "Leave blank to default to non-rural (NR)."
+        )
+        self.zip_edit.textChanged.connect(self._on_zip_changed)
+        row1.addWidget(self.zip_edit)
+
+        self.rural_label = QLabel("No ZIP (default NR)")
+        self.rural_label.setStyleSheet("color: #666666; font-size: 11px;")
+        self.rural_label.setMinimumWidth(150)
+        row1.addWidget(self.rural_label)
+
+        row1.addStretch()
+        toolbar_container.addLayout(row1)
+
+        # ---- Row 2: Group | HCPCS | Keyword | Search | Clear | Export ----
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        # HCPCS Group filter
+        self._group_label = QLabel("Group:")
+        row2.addWidget(self._group_label)
+        self.group_combo = QComboBox()
+        self.group_combo.setMinimumWidth(220)
+        self.group_combo.addItem("All Groups", None)
+        from core.hcpcs_groups import get_group_choices
+        from core.database import get_available_hcpcs_prefixes
+        available_prefixes = get_available_hcpcs_prefixes()
+        for prefix, label in get_group_choices(only_prefixes=available_prefixes or None):
+            self.group_combo.addItem(label, prefix)
+        self.group_combo.currentIndexChanged.connect(self._apply_filters)
+        self.group_combo.currentIndexChanged.connect(self._save_filter_preferences)
+        row2.addWidget(self.group_combo)
+        row2.addSpacing(8)
+
+        # HCPCS code search (debounced)
+        row2.addWidget(QLabel("HCPCS:"))
+        self.code_edit = QLineEdit()
+        self.code_edit.setPlaceholderText("e.g. E0601")
+        self.code_edit.setMaximumWidth(110)
+        self.code_edit.textChanged.connect(self._on_search_text_changed)
+        self.code_edit.returnPressed.connect(self._apply_filters)
+        row2.addWidget(self.code_edit)
+
+        row2.addSpacing(8)
+
+        # Keyword search (debounced)
+        row2.addWidget(QLabel("Keyword:"))
+        self.keyword_edit = QLineEdit()
+        self.keyword_edit.setPlaceholderText("Description keyword…")
+        self.keyword_edit.setMinimumWidth(180)
+        self.keyword_edit.textChanged.connect(self._on_search_text_changed)
+        self.keyword_edit.returnPressed.connect(self._apply_filters)
+        row2.addWidget(self.keyword_edit)
+
+        row2.addSpacing(4)
+
+        search_btn = QPushButton("Search")
+        search_btn.clicked.connect(self._apply_filters)
+        row2.addWidget(search_btn)
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear_filters)
+        row2.addWidget(clear_btn)
+
+        row2.addStretch()
+
+        export_btn = QPushButton("Export…")
+        export_btn.setStyleSheet(
+            "background-color: #005A9C; color: white; padding: 6px 14px; font-weight: bold;"
+        )
+        export_btn.clicked.connect(self._export)
+        row2.addWidget(export_btn)
+
+        toolbar_container.addLayout(row2)
+        root.addLayout(toolbar_container)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        root.addWidget(sep)
+
+        # ---- Results table ----
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels([
+            "HCPCS Code", "Description", "State", "Year",
+            "Allowable ($)", "Modifier", "Source",
+        ])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setDefaultSectionSize(100)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(True)
+        # Ensure selected-row text (including the blue hyperlink in col 0) is
+        # always visible by forcing white text on the selection highlight.
+        self.table.setStyleSheet(
+            "QTableWidget::item:selected { background-color: #003366; color: white; }"
+            "QTableWidget::item:selected:!active { background-color: #4a7ab5; color: white; }"
+            "QTableWidget::item:hover { background-color: #e0e8f0; }"
+        )
+        self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.doubleClicked.connect(self._on_row_double_clicked)
+        self.table.setToolTip("Click HCPCS code to view history. Right-click for copy options.")
+        # Context menu
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_table_context_menu)
+        root.addWidget(self.table, 1)
+
+        # ---- Status bar ----
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self._set_status("Ready.")
+
+    def _init_menu(self):
+        menubar = self.menuBar()
+
+        # File
+        file_menu = menubar.addMenu("&File")
+
+        import_action = QAction("&Import CSV…", self)
+        import_action.setShortcut("Ctrl+I")
+        import_action.triggered.connect(self._import_csv)
+        file_menu.addAction(import_action)
+
+        file_menu.addSeparator()
+
+        log_action = QAction("View Import &Log", self)
+        log_action.triggered.connect(self._show_import_log)
+        file_menu.addAction(log_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+        # Settings
+        settings_menu = menubar.addMenu("&Settings")
+
+        states_action = QAction("&Manage States…", self)
+        states_action.triggered.connect(self._manage_states)
+        settings_menu.addAction(states_action)
+
+        years_action = QAction("Manage &Years…", self)
+        years_action.triggered.connect(self._manage_years)
+        settings_menu.addAction(years_action)
+
+        settings_menu.addSeparator()
+
+        db_path_action = QAction("Change &Database Path…", self)
+        db_path_action.triggered.connect(self._change_db_path)
+        settings_menu.addAction(db_path_action)
+
+        shortcut_action = QAction("Create &Desktop Shortcut", self)
+        shortcut_action.triggered.connect(self._create_desktop_shortcut)
+        settings_menu.addAction(shortcut_action)
+
+        # View
+        view_menu = menubar.addMenu("&View")
+
+        browse_groups_action = QAction("Browse HCPCS &Groups…", self)
+        browse_groups_action.triggered.connect(self._browse_groups)
+        view_menu.addAction(browse_groups_action)
+
+        # Developer Tools
+        dev_menu = menubar.addMenu("&Developer Tools")
+        sql_action = QAction("&SQL Publisher…", self)
+        sql_action.triggered.connect(self._open_sql_publisher)
+        dev_menu.addAction(sql_action)
+
+        # Help
+        help_menu = menubar.addMenu("&Help")
+
+        about_action = QAction("&About", self)
+        about_action.triggered.connect(self._show_about)
+        help_menu.addAction(about_action)
+
+    # --------------------------------------------------------------- Slots --
+
+    def _check_first_run(self):
+        if get_preference("first_run_done") != "1":
+            from ui.setup_wizard import SetupWizard
+            wizard = SetupWizard(self)
+            wizard.exec()
+            self._refresh_filters()
+            self._apply_filters()
+
+    def _refresh_filters(self):
+        """Reload year and state combos from the database."""
+        self.year_combo.blockSignals(True)
+        self.state_combo.blockSignals(True)
+
+        # Years
+        prev_year = self.year_combo.currentData()
+        self.year_combo.clear()
+        self.year_combo.addItem("All Years", None)
+        if self._is_pfs_mode():
+            for y in get_available_pfs_years():
+                self.year_combo.addItem(str(y), y)
+            target_year = get_current_pfs_year_or_fallback()
+        else:
+            for y in get_available_years():
+                self.year_combo.addItem(str(y), y)
+            target_year = get_current_year_or_fallback()
+        if target_year is not None:
+            idx = self.year_combo.findData(target_year)
+            if idx >= 0:
+                self.year_combo.setCurrentIndex(idx)
+        elif prev_year is not None:
+            idx = self.year_combo.findData(prev_year)
+            if idx >= 0:
+                self.year_combo.setCurrentIndex(idx)
+
+        # States
+        prev_state = self.state_combo.currentData()
+        self.state_combo.clear()
+        self.state_combo.addItem("All States", None)
+        for abbr, name in get_selected_states():
+            self.state_combo.addItem(f"{name} ({abbr})", abbr)
+        if prev_state is not None:
+            idx = self.state_combo.findData(prev_state)
+            if idx >= 0:
+                self.state_combo.setCurrentIndex(idx)
+
+        self.year_combo.blockSignals(False)
+        self.state_combo.blockSignals(False)
+
+        self._update_year_view_label()
+        self._refresh_group_combo()
+
+    def _refresh_group_combo(self):
+        """Reload the group combo to only show groups that have data in the database."""
+        if not hasattr(self, "group_combo"):
+            return
+        from core.hcpcs_groups import get_group_choices
+        from core.database import get_available_hcpcs_prefixes
+        prev_group = self.group_combo.currentData()
+        self.group_combo.blockSignals(True)
+        self.group_combo.clear()
+        self.group_combo.addItem("All Groups", None)
+        available_prefixes = get_available_hcpcs_prefixes()
+        for prefix, label in get_group_choices(only_prefixes=available_prefixes or None):
+            self.group_combo.addItem(label, prefix)
+        if prev_group is not None:
+            idx = self.group_combo.findData(prev_group)
+            if idx >= 0:
+                self.group_combo.setCurrentIndex(idx)
+        self.group_combo.blockSignals(False)
+
+    def _update_year_view_label(self):
+        """Update the year view label to show the effective year being displayed."""
+        if not hasattr(self, "year_view_label"):
+            return
+        y = self.year_combo.currentData()
+        if y is not None:
+            self.year_view_label.setText(f"(Showing year: {y})")
+        else:
+            fallback = get_current_year_or_fallback()
+            current_year = date.today().year
+            if fallback is None:
+                self.year_view_label.setText("(No data — sync from CMS)")
+                self.year_view_label.setStyleSheet("color: #CC3300; font-style: italic; font-size: 11px;")
+            elif fallback == current_year:
+                self.year_view_label.setText(f"(Showing current year: {current_year})")
+                self.year_view_label.setStyleSheet("color: #555555; font-style: italic; font-size: 11px;")
+            else:
+                self.year_view_label.setText(
+                    f"(Latest available: {fallback} — no data for {current_year})"
+                )
+                self.year_view_label.setStyleSheet("color: #AA5500; font-style: italic; font-size: 11px;")
+
+    def _effective_year(self):
+        """Return the year that should drive rural ZIP determination.
+
+        "All Years" → current year or most recent in DB.
+        Specific year → that year.
+        """
+        y = self.year_combo.currentData()
+        if y is not None:
+            return y
+        return get_current_year_or_fallback()
+
+    def _is_rural(self):
+        """Return True if the entered ZIP code is rural for the effective year."""
+        zip5 = self.zip_edit.text().strip()
+        if len(zip5) != 5 or not zip5.isdigit():
+            return False
+        eff_year = self._effective_year()
+        if eff_year is None:
+            return False
+        return is_rural_zip(eff_year, zip5)
+
+    def _on_year_changed(self):
+        """Re-evaluate rural label when year changes (rural ZIP sets are year-scoped)."""
+        self._update_year_view_label()
+        self._save_filter_preferences()
+        self._on_zip_changed(self.zip_edit.text())
+
+    def _on_schedule_type_changed(self):
+        """Show/hide DMEPOS-specific controls when schedule type changes."""
+        is_pfs = self._is_pfs_mode()
+        self.state_combo.setVisible(not is_pfs)
+        self._state_label.setVisible(not is_pfs)
+        self.zip_edit.setVisible(not is_pfs)
+        self._zip_label.setVisible(not is_pfs)
+        self.rural_label.setVisible(not is_pfs)
+        if hasattr(self, "group_combo"):
+            self.group_combo.setVisible(not is_pfs)
+            self._group_label.setVisible(not is_pfs)
+        if is_pfs:
+            self.table.setColumnCount(6)
+            self.table.setHorizontalHeaderLabels(_PFS_COLUMN_HEADERS)
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setDefaultSectionSize(120)
+        else:
+            self.table.setColumnCount(7)
+            self.table.setHorizontalHeaderLabels([
+                "HCPCS Code", "Description", "State", "Year",
+                "Allowable ($)", "Modifier", "Source",
+            ])
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setDefaultSectionSize(100)
+        self._refresh_filters()
+        self._apply_filters()
+        set_preference("schedule_type", self.schedule_combo.currentData())
+
+    def _is_pfs_mode(self):
+        """Return True if Physician Fee Schedule mode is selected."""
+        return hasattr(self, "schedule_combo") and self.schedule_combo.currentData() == "pfs"
+
+    def _sync_rural_label(self):
+        """Update the rural/non-rural label to match the current ZIP field.
+
+        Unlike ``_on_zip_changed``, this never triggers filter application,
+        making it safe to call during startup or preference restoration.
+        """
+        zip5 = self.zip_edit.text().strip()
+        if not zip5:
+            self.rural_label.setText("No ZIP (default NR)")
+            self.rural_label.setStyleSheet("color: #666666; font-size: 11px;")
+        elif len(zip5) == 5 and zip5.isdigit():
+            rural = self._is_rural()
+            if rural:
+                self.rural_label.setText(f"ZIP {zip5} → Rural (R)")
+                self.rural_label.setStyleSheet("color: #006600; font-weight: bold; font-size: 11px;")
+            else:
+                self.rural_label.setText(f"ZIP {zip5} → Non-Rural (NR)")
+                self.rural_label.setStyleSheet("color: #003366; font-weight: bold; font-size: 11px;")
+        else:
+            self.rural_label.setText("")
+            self.rural_label.setStyleSheet("color: #666666; font-size: 11px;")
+
+    def _on_zip_changed(self, text):
+        """Update rural label and refresh display when ZIP input changes."""
+        self._sync_rural_label()
+        zip5 = text.strip()
+        if not zip5 or (len(zip5) == 5 and zip5.isdigit()):
+            self._save_filter_preferences()
+            self._apply_filters()
+
+    def _query_year(self):
+        """Return the year to pass to the query.
+
+        "All Years" with no specific year selected shows current (or fallback) year only.
+        """
+        y = self.year_combo.currentData()
+        if y is not None:
+            return y
+        # "All Years" → show current year only (or fallback)
+        if self._is_pfs_mode():
+            return get_current_pfs_year_or_fallback()
+        return get_current_year_or_fallback()
+
+    def _on_search_text_changed(self):
+        """Restart the debounce timer when HCPCS or Keyword text changes."""
+        self._search_timer.start()
+
+    def _apply_filters(self):
+        year = self._query_year()
+        code = self.code_edit.text().strip() or None
+        keyword = self.keyword_edit.text().strip() or None
+
+        if self._is_pfs_mode():
+            self._records = get_pfs_fees(
+                year=year,
+                hcpcs_code=code,
+                keyword=keyword,
+            )
+        else:
+            state = self.state_combo.currentData()
+            group = self.group_combo.currentData() if hasattr(self, "group_combo") else None
+            self._records = get_fees(
+                state_abbr=state,
+                year=year,
+                hcpcs_code=code,
+                keyword=keyword,
+                hcpcs_group=group,
+            )
+        self._populate_table(self._records)
+        self._set_status(f"{len(self._records):,} records found.")
+        self._save_filter_preferences()
+
+    def _clear_filters(self):
+        self.year_combo.setCurrentIndex(0)
+        self.state_combo.setCurrentIndex(0)
+        self.group_combo.setCurrentIndex(0)
+        self.code_edit.clear()
+        self.keyword_edit.clear()
+        self.zip_edit.clear()
+        self._apply_filters()
+
+    # ------------------------------------------------- Filter persistence ---
+
+    def _save_filter_preferences(self):
+        """Persist current filter values to user preferences."""
+        try:
+            set_preference("filter_year", str(self.year_combo.currentData() or ""))
+            set_preference("filter_state", str(self.state_combo.currentData() or ""))
+            set_preference("filter_group", str(self.group_combo.currentData() or ""))
+            set_preference("filter_zip", self.zip_edit.text().strip())
+            set_preference("filter_hcpcs", self.code_edit.text().strip())
+            set_preference("filter_keyword", self.keyword_edit.text().strip())
+        except Exception:
+            pass  # Persistence is best-effort; don't crash the UI
+
+    def _restore_filter_preferences(self):
+        """Restore previously saved filter values from user preferences."""
+        try:
+            # Block all filter-widget signals so that restoring saved values does
+            # not trigger _apply_filters (or start the debounce timer) before the
+            # window is visible.  We update the derived labels manually below.
+            _widgets = [
+                self.year_combo, self.state_combo, self.group_combo,
+                self.zip_edit, self.code_edit, self.keyword_edit,
+            ]
+            for w in _widgets:
+                w.blockSignals(True)
+            try:
+                saved_year = get_preference("filter_year", "")
+                if saved_year:
+                    try:
+                        y = int(saved_year)
+                        idx = self.year_combo.findData(y)
+                        if idx >= 0:
+                            self.year_combo.setCurrentIndex(idx)
+                    except ValueError:
+                        pass
+
+                saved_state = get_preference("filter_state", "")
+                if saved_state:
+                    idx = self.state_combo.findData(saved_state)
+                    if idx >= 0:
+                        self.state_combo.setCurrentIndex(idx)
+
+                saved_group = get_preference("filter_group", "")
+                if saved_group and hasattr(self, "group_combo"):
+                    idx = self.group_combo.findData(saved_group)
+                    if idx >= 0:
+                        self.group_combo.setCurrentIndex(idx)
+
+                saved_zip = get_preference("filter_zip", "")
+                if saved_zip:
+                    self.zip_edit.setText(saved_zip)
+
+                saved_hcpcs = get_preference("filter_hcpcs", "")
+                if saved_hcpcs:
+                    self.code_edit.setText(saved_hcpcs)
+
+                saved_keyword = get_preference("filter_keyword", "")
+                if saved_keyword:
+                    self.keyword_edit.setText(saved_keyword)
+            finally:
+                for w in _widgets:
+                    w.blockSignals(False)
+
+            # Refresh derived labels now that all values are in place.
+            self._update_year_view_label()
+            self._sync_rural_label()
+
+            # Restore schedule type
+            saved_schedule = get_preference("schedule_type", "dmepos")
+            if saved_schedule and hasattr(self, "schedule_combo"):
+                idx = self.schedule_combo.findData(saved_schedule)
+                if idx >= 0:
+                    self.schedule_combo.blockSignals(True)
+                    self.schedule_combo.setCurrentIndex(idx)
+                    self.schedule_combo.blockSignals(False)
+                    is_pfs = saved_schedule == "pfs"
+                    self.state_combo.setVisible(not is_pfs)
+                    self.zip_edit.setVisible(not is_pfs)
+                    self.rural_label.setVisible(not is_pfs)
+                    if hasattr(self, "group_combo"):
+                        self.group_combo.setVisible(not is_pfs)
+                    if is_pfs:
+                        self.table.setColumnCount(6)
+                        self.table.setHorizontalHeaderLabels(_PFS_COLUMN_HEADERS)
+                    else:
+                        self.table.setColumnCount(7)
+                        self.table.setHorizontalHeaderLabels([
+                            "HCPCS Code", "Description", "State", "Year",
+                            "Allowable ($)", "Modifier", "Source",
+                        ])
+        except Exception:
+            pass  # Preference restore is best-effort
+
+    def _populate_table(self, records):
+        if self._is_pfs_mode():
+            self._populate_pfs_table(records)
+        else:
+            self._populate_dmepos_table(records)
+
+    def _populate_dmepos_table(self, records):
+        is_rural = self._is_rural()
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(records))
+        link_color = QColor("#0066CC")
+        link_font = QFont()
+        link_font.setUnderline(True)
+        for row_i, r in enumerate(records):
+            # Compute chosen allowable based on rural flag
+            if is_rural:
+                chosen = r.get("allowable_r") or r.get("allowable_nr") or r.get("allowable")
+            else:
+                chosen = r.get("allowable_nr") or r.get("allowable")
+
+            values = [
+                r.get("hcpcs_code", ""),
+                r.get("description", ""),
+                r.get("state_abbr", ""),
+                str(r.get("year", "")),
+                "—" if chosen is None else f"{chosen:,.2f}",
+                r.get("modifier", "") or "",
+                r.get("data_source", "") or "",
+            ]
+            for col_i, v in enumerate(values):
+                item = QTableWidgetItem(str(v))
+                if col_i == 0:
+                    item.setForeground(link_color)
+                    item.setFont(link_font)
+                    item.setToolTip("Click to view history for this HCPCS code")
+                    item.setData(Qt.ItemDataRole.UserRole, row_i)
+                if col_i == 4 and chosen is None:
+                    item.setForeground(Qt.GlobalColor.darkGray)
+                self.table.setItem(row_i, col_i, item)
+        self.table.setSortingEnabled(True)
+
+    def _populate_pfs_table(self, records):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(records))
+        link_color = QColor("#0066CC")
+        link_font = QFont()
+        link_font.setUnderline(True)
+        right_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for row_i, r in enumerate(records):
+            nf = r.get("payment_non_facility")
+            f = r.get("payment_facility")
+            values = [
+                (r.get("hcpcs_code", ""), Qt.AlignmentFlag.AlignLeft),
+                (r.get("description", ""), Qt.AlignmentFlag.AlignLeft),
+                ("—" if nf is None else f"{nf:,.2f}", right_align),
+                ("—" if f is None else f"{f:,.2f}", right_align),
+                (str(r.get("year", "")), Qt.AlignmentFlag.AlignCenter),
+                (r.get("data_source", "") or "", Qt.AlignmentFlag.AlignLeft),
+            ]
+            for col_i, (v, align) in enumerate(values):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(align)
+                if col_i == 0:
+                    item.setForeground(link_color)
+                    item.setFont(link_font)
+                    item.setToolTip("Click to view PFS history for this code")
+                    item.setData(Qt.ItemDataRole.UserRole, row_i)
+                self.table.setItem(row_i, col_i, item)
+        self.table.setSortingEnabled(True)
+
+    def _on_cell_clicked(self, row, col):
+        """Open history dialog when the HCPCS code cell (column 0) is clicked."""
+        if col == 0:
+            self._open_history_for_row(row)
+
+    def _on_row_double_clicked(self, index):
+        """Open historical detail dialog for the double-clicked HCPCS row."""
+        row = index.row()
+        if index.column() != 0:
+            self._open_history_for_row(row)
+
+    def _open_history_for_row(self, row):
+        """Open the history dialog for the given table row."""
+        if self._is_pfs_mode():
+            return  # PFS mode: no history dialog
+        first_item = self.table.item(row, 0)
+        if first_item is None:
+            return
+        rec_idx = first_item.data(Qt.ItemDataRole.UserRole)
+        if rec_idx is None or rec_idx < 0 or rec_idx >= len(self._records):
+            return
+        record = self._records[rec_idx]
+        dlg = _HcpcsHistoryDialog(record, self)
+        dlg.exec()
+
+    # ---------------------------------------------------- Context menu ------
+
+    def _on_table_context_menu(self, pos):
+        """Show right-click context menu on main grid with copy actions."""
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        first_item = self.table.item(row, 0)
+        if first_item is None:
+            return
+
+        menu = QMenu(self)
+
+        def copy_text(col):
+            item = self.table.item(row, col)
+            if item:
+                QApplication.clipboard().setText(item.text())
+
+        def copy_row_csv():
+            vals = []
+            for c in range(self.table.columnCount()):
+                item = self.table.item(row, c)
+                v = item.text() if item else ""
+                vals.append(f'"{v}"')
+            QApplication.clipboard().setText(",".join(vals))
+
+        menu.addAction("Copy HCPCS", lambda: copy_text(0))
+        menu.addAction("Copy Description", lambda: copy_text(1))
+        menu.addAction("Copy Effective Allowable", lambda: copy_text(4))
+        menu.addSeparator()
+        menu.addAction("Copy Row as CSV", copy_row_csv)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _import_csv(self):
+        dlg = ImportDialog(self)
+        dlg.import_complete.connect(self._on_import_done)
+        dlg.exec()
+
+    def _on_import_done(self, count):
+        self._refresh_filters()
+        self._apply_filters()
+        self._set_status(f"Imported {count:,} records.")
+
+    def _export(self):
+        if not self._records:
+            QMessageBox.information(self, "No Data", "No records to export. Apply filters first.")
+            return
+        if self._is_pfs_mode():
+            dlg = ExportDialog(
+                self._records, self,
+                is_rural=False, zip_code="",
+                columns=_PFS_COLUMNS,
+                column_headers=_PFS_COLUMN_HEADERS,
+            )
+        else:
+            zip_code = self.zip_edit.text().strip()
+            dlg = ExportDialog(self._records, self, is_rural=self._is_rural(), zip_code=zip_code)
+        dlg.exec()
+
+    def _manage_states(self):
+        dlg = StateSelectorDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_filters()
+            self._apply_filters()
+
+    def _manage_years(self):
+        dlg = YearSelectorDialog(self)
+        dlg.exec()
+
+    def _browse_groups(self):
+        from ui.group_browser_dialog import GroupBrowserDialog
+        dlg = GroupBrowserDialog(self)
+        dlg.exec()
+
+    def _create_desktop_shortcut(self):
+        from core.shortcut import can_create_shortcut, create_desktop_shortcut, shortcut_exists
+        if not can_create_shortcut():
+            QMessageBox.information(
+                self, "Desktop Shortcut",
+                "Desktop shortcuts can only be created when running as the installed .exe on Windows.",
+            )
+            return
+        if shortcut_exists():
+            ans = QMessageBox.question(
+                self, "Desktop Shortcut",
+                "A desktop shortcut already exists. Replace it?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        ok = create_desktop_shortcut()
+        if ok:
+            QMessageBox.information(self, "Desktop Shortcut", "Desktop shortcut created successfully.")
+        else:
+            QMessageBox.warning(self, "Desktop Shortcut", "Failed to create desktop shortcut.")
+
+    def _change_db_path(self):
+        from core.config import get_data_dir, set_data_dir
+        from pathlib import Path
+        current = str(get_data_dir())
+        folder = QFileDialog.getExistingDirectory(self, "Select Database Folder", current)
+        if not folder:
+            return
+        new_path = Path(folder)
+        if new_path == get_data_dir():
+            return
+        ans = QMessageBox.question(
+            self, "Change Database Path",
+            f"Change the database folder to:\n{folder}\n\n"
+            "The app will use this location the next time it starts.\n"
+            "Your existing data will NOT be moved automatically.\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            set_data_dir(new_path)
+            QMessageBox.information(
+                self, "Database Path Changed",
+                f"Database folder set to:\n{folder}\n\nRestart the app for the change to take effect.",
+            )
+
+    def _open_sql_publisher(self):
+        from ui.dev_tools_dialog import DevToolsDialog
+        dlg = DevToolsDialog(current_records=self._records, parent=self)
+        dlg.exec()
+
+    def _sync_cms(self):
+        if self._is_pfs_mode():
+            self._sync_pfs()
+            return
+        selected = get_selected_states()
+        if not selected:
+            QMessageBox.warning(
+                self, "No States Selected",
+                "Please go to Settings → Manage States and select at least one state before syncing.",
+            )
+            return
+
+        state_abbrs = [abbr for abbr, _ in selected]
+
+        # Ask which years
+        dlg = _SyncYearsDialog(state_abbrs, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        years = dlg.selected_years()
+        if not years:
+            return
+
+        # Build a modal progress dialog parented to main window
+        self._progress_dlg = QProgressDialog("Starting sync…", None, 0, 0, self)
+        self._progress_dlg.setWindowTitle("Syncing from CMS")
+        self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dlg.setMinimumWidth(500)
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        # Centre over main window
+        geo = self.geometry()
+        dlg_w, dlg_h = 500, 120
+        self._progress_dlg.setGeometry(
+            geo.x() + (geo.width() - dlg_w) // 2,
+            geo.y() + (geo.height() - dlg_h) // 2,
+            dlg_w, dlg_h,
+        )
+        self._progress_dlg.show()
+        self._progress_dlg.raise_()
+        self._progress_dlg.activateWindow()
+
+        self._set_status("Syncing from CMS…")
+        self._sync_worker = SyncWorker(years, state_abbrs)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished.connect(self._on_sync_done)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.start()
+
+    def _on_sync_progress(self, msg):
+        self._set_status(msg)
+        if self._progress_dlg:
+            self._progress_dlg.setLabelText(msg)
+            self._progress_dlg.raise_()
+
+    def _on_sync_done(self, count):
+        if self._progress_dlg:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._refresh_filters()
+        self._apply_filters()
+        self._set_status(f"CMS sync complete — {count:,} records imported.")
+        QMessageBox.information(
+            self, "Sync Complete",
+            f"Successfully imported {count:,} records from CMS.",
+        )
+
+    def _on_sync_error(self, msg):
+        if self._progress_dlg:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._set_status("Sync failed.")
+        QMessageBox.critical(self, "Sync Error", msg)
+
+    def _sync_pfs(self):
+        """Trigger PFS national payment amount sync."""
+        dlg = _SyncPfsYearsDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        years = dlg.selected_years()
+        if not years:
+            return
+
+        self._progress_dlg = QProgressDialog("Starting PFS sync…", None, 0, 0, self)
+        self._progress_dlg.setWindowTitle("Syncing PFS from CMS")
+        self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dlg.setMinimumWidth(500)
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        geo = self.geometry()
+        dlg_w, dlg_h = 500, 120
+        self._progress_dlg.setGeometry(
+            geo.x() + (geo.width() - dlg_w) // 2,
+            geo.y() + (geo.height() - dlg_h) // 2,
+            dlg_w, dlg_h,
+        )
+        self._progress_dlg.show()
+        self._progress_dlg.raise_()
+        self._progress_dlg.activateWindow()
+
+        self._set_status("Syncing PFS from CMS…")
+        self._sync_worker = PfsSyncWorker(years)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished.connect(self._on_pfs_sync_done)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.start()
+
+    def _on_pfs_sync_done(self, count):
+        if self._progress_dlg:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._refresh_filters()
+        self._apply_filters()
+        self._set_status(f"PFS sync complete — {count:,} records imported.")
+        QMessageBox.information(
+            self, "PFS Sync Complete",
+            f"Successfully imported {count:,} PFS records from CMS.",
+        )
+
+    def _show_import_log(self):
+        dlg = _ImportLogDialog(self)
+        dlg.exec()
+
+    def _show_about(self):
+        dlg = _AboutDialog(self)
+        dlg.exec()
+
+    def _start_update_check(self):
+        """Start a background thread to check for app updates."""
+        from core.update_checker import UpdateCheckWorker
+        self._update_worker = UpdateCheckWorker()
+        self._update_worker.update_available.connect(self._on_update_available)
+        self._update_worker.finished.connect(self._update_worker.deleteLater)
+        self._update_worker.start()
+
+    def _on_update_available(self, version, url):
+        """Show the update notification bar when a new version is found."""
+        # Validate URL is a GitHub URL to prevent injection from unexpected API responses
+        if not url.startswith("https://github.com/"):
+            from core.version import RELEASES_URL
+            url = RELEASES_URL
+        self._update_pending_version = version
+        self._update_pending_url = url
+        self.update_bar.setText(
+            f'🔔 <b>Update available!</b> Version {version} is ready. '
+            f'<a href="{url}" style="color: #0D6EFD;">Download now</a>'
+        )
+        # Show the "Update Now" button only when running as a frozen exe
+        self._update_now_btn.setVisible(getattr(sys, "frozen", False))
+        self._update_bar_widget.show()
+
+    def _on_update_now(self):
+        """Download and apply the update in-place, or fall back to browser."""
+        import webbrowser
+        url = getattr(self, "_update_pending_url", None)
+        version = getattr(self, "_update_pending_version", "?")
+
+        # Only attempt self-update when running as a frozen exe
+        if not getattr(sys, "frozen", False):
+            if url:
+                webbrowser.open(url)
+            return
+
+        from core.version import get_latest_release_asset_url
+
+        asset_url = get_latest_release_asset_url("HCPCSFeeApp.exe")
+        if not asset_url:
+            # No direct asset URL — open the releases page instead
+            if url:
+                webbrowser.open(url)
+            return
+
+        # Show an indeterminate progress dialog while downloading
+        dlg = QProgressDialog(
+            f"Downloading version {version}…", "Cancel", 0, 0, self
+        )
+        dlg.setWindowTitle("Updating…")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+
+        cancelled = False
+
+        def _on_cancel():
+            nonlocal cancelled
+            cancelled = True
+
+        dlg.canceled.connect(_on_cancel)
+
+        def _progress(downloaded, total):
+            if cancelled:
+                return
+            if total and total > 0:
+                dlg.setMaximum(total)
+                dlg.setValue(downloaded)
+            QApplication.processEvents()
+
+        try:
+            from core.self_updater import download_update, apply_update
+            new_exe = download_update(asset_url, progress_callback=_progress)
+            dlg.close()
+
+            if cancelled:
+                try:
+                    new_exe.unlink()
+                except Exception:
+                    pass
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "Apply Update",
+                f"Version {version} has been downloaded.\n\n"
+                "The app will restart to complete the update.\n\nContinue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                apply_update(new_exe)  # does not return — calls sys.exit(0)
+            else:
+                # User declined — clean up the downloaded file
+                try:
+                    new_exe.unlink()
+                except Exception:
+                    pass
+
+        except Exception as exc:
+            dlg.close()
+            QMessageBox.warning(
+                self,
+                "Update Failed",
+                f"Automatic update failed:\n{exc}\n\n"
+                "Please download the update manually.",
+            )
+            if url:
+                webbrowser.open(url)
+
+    def _set_status(self, msg):
+        self.status_bar.showMessage(msg)
+
+
+# ----------------------------------------------------------------- Helpers --
+
+class _AboutDialog(QDialog):
+    """Rich About dialog displaying the WSNC map banner and app details."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("About VA HCPCS Fee Schedule Manager")
+        self.setFixedWidth(620)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 16)
+
+        # ---- WSNC map banner ------------------------------------------------
+        map_path = _asset("wsnc_map.png")
+        if map_path.exists():
+            banner_label = QLabel()
+            pix = QPixmap(str(map_path)).scaledToWidth(
+                620, Qt.TransformationMode.SmoothTransformation
+            )
+            banner_label.setPixmap(pix)
+            banner_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(banner_label)
+        else:
+            title_lbl = QLabel("VISN 22 · Impact Team")
+            title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            title_lbl.setStyleSheet(
+                "background:#003366; color:white; font-size:14px;"
+                "font-weight:bold; padding:16px;"
+            )
+            layout.addWidget(title_lbl)
+
+        # ---- App icon + title row -------------------------------------------
+        header = QHBoxLayout()
+        header.setContentsMargins(16, 4, 16, 0)
+        icon_path = _asset("wsnc_map.png")
+        if icon_path.exists():
+            icon_lbl = QLabel()
+            icon_lbl.setPixmap(
+                QPixmap(str(icon_path)).scaled(
+                    48, 48,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            header.addWidget(icon_lbl)
+        from core.version import APP_VERSION
+        app_title = QLabel(f"<b>VA HCPCS Fee Schedule Manager</b> v{APP_VERSION}")
+        app_title.setStyleSheet("font-size:14px; color:#003366;")
+        header.addWidget(app_title, 1)
+        layout.addLayout(header)
+
+        # ---- Description text -----------------------------------------------
+        body = QLabel(
+            "A standalone Windows desktop application for VA staff to manage,<br>"
+            "view, filter, and export CMS DMEPOS HCPCS fee schedule data.<br><br>"
+            "<b>Tip:</b> Enter a ZIP code in the toolbar to automatically display<br>"
+            "rural (R) or non-rural (NR) allowable amounts, similar to PDAC fee lookup.<br><br>"
+            "Data source: <a href='https://www.cms.gov/medicare/payment/fee-schedules/dmepos'>"
+            "CMS DMEPOS Fee Schedule</a><br><br>"
+            "Developed by the <b>VISN 22 Impact Team</b>"
+        )
+        body.setContentsMargins(16, 0, 16, 0)
+        body.setWordWrap(True)
+        body.setOpenExternalLinks(True)
+        body.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        layout.addWidget(body)
+
+        # ---- Close button ---------------------------------------------------
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(16, 0, 16, 0)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+
+class _SyncYearsDialog(QDialog):
+    """Simple dialog to pick which year(s) to sync."""
+
+    def __init__(self, state_abbrs, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sync from CMS")
+        self.setMinimumWidth(340)
+        self._checks = {}
+        layout = QVBoxLayout(self)
+
+        states_label = QLabel(
+            f"Syncing data for: <b>{', '.join(sorted(state_abbrs))}</b>"
+        )
+        states_label.setWordWrap(True)
+        layout.addWidget(states_label)
+        layout.addWidget(QLabel("Select year(s) to download:"))
+
+        for year in SUPPORTED_YEARS:
+            cb = QCheckBox(str(year))
+            layout.addWidget(cb)
+            self._checks[year] = cb
+
+        saved_years = get_selected_years()
+        # If nothing saved, default to current + last 3
+        from core.database import get_default_selected_years
+        defaults = saved_years if saved_years else get_default_selected_years()
+        for year, cb in self._checks.items():
+            cb.setChecked(year in defaults)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        sync_btn = QPushButton("Sync")
+        sync_btn.setStyleSheet(
+            "background-color: #003366; color: white; padding: 6px 16px; font-weight: bold;"
+        )
+        cancel_btn.clicked.connect(self.reject)
+        sync_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(sync_btn)
+        layout.addLayout(btn_row)
+
+    def selected_years(self):
+        return [y for y, cb in self._checks.items() if cb.isChecked()]
+
+
+class _SyncPfsYearsDialog(QDialog):
+    """Simple dialog to pick which year(s) to sync for PFS."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sync PFS from CMS")
+        self.setMinimumWidth(340)
+        self._checks = {}
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            "Download CMS Physician Fee Schedule\n"
+            "National Payment Amount file.\n"
+            "\nSelect year(s) to download:"
+        ))
+
+        for year in PFS_SUPPORTED_YEARS:
+            cb = QCheckBox(str(year))
+            layout.addWidget(cb)
+            self._checks[year] = cb
+
+        current = date.today().year
+        for year, cb in self._checks.items():
+            cb.setChecked(year == current)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        sync_btn = QPushButton("Sync")
+        sync_btn.setStyleSheet(
+            "background-color: #003366; color: white; padding: 6px 16px; font-weight: bold;"
+        )
+        cancel_btn.clicked.connect(self.reject)
+        sync_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(sync_btn)
+        layout.addLayout(btn_row)
+
+    def selected_years(self):
+        return [y for y, cb in self._checks.items() if cb.isChecked()]
+
+
+class _HcpcsHistoryDialog(QDialog):
+    """Modernized history dialog showing NR/R/Effective across years for a HCPCS code.
+
+    Features:
+    - Summary card header (HCPCS, State, Description, ZIP / rural status)
+    - Primary state table: Year, NR ($), R ($), Effective ($), Modifier, Source
+    - Optional comparison state table (no Effective column; ZIP not applicable cross-state)
+    """
+
+    def __init__(self, record, parent=None):
+        super().__init__(parent)
+        hcpcs = record.get("hcpcs_code", "")
+        state = record.get("state_abbr", "")
+        modifier = record.get("modifier") or ""
+        desc = record.get("description", "")
+
+        # Grab ZIP from parent MainWindow (if available) for Effective computation
+        self._zip5 = ""
+        if hasattr(parent, "zip_edit"):
+            self._zip5 = parent.zip_edit.text().strip()
+
+        self.setWindowTitle(f"History: {hcpcs} — {state}")
+        self.setMinimumSize(860, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # ---- Summary card ----
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card.setStyleSheet(
+            "QFrame { background: #eef2f7; border: 1px solid #c0c8d8; border-radius: 6px; }"
+        )
+        card_layout = QGridLayout(card)
+        card_layout.setContentsMargins(12, 8, 12, 8)
+        card_layout.setHorizontalSpacing(16)
+
+        def _bold(text):
+            lbl = QLabel(f"<b>{text}</b>")
+            return lbl
+
+        def _val(text):
+            lbl = QLabel(str(text) if text else "—")
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            return lbl
+
+        card_layout.addWidget(_bold("HCPCS:"), 0, 0)
+        card_layout.addWidget(_val(hcpcs), 0, 1)
+        card_layout.addWidget(_bold("State:"), 0, 2)
+        card_layout.addWidget(_val(state), 0, 3)
+        if modifier:
+            card_layout.addWidget(_bold("Modifier:"), 0, 4)
+            card_layout.addWidget(_val(modifier), 0, 5)
+
+        desc_label = QLabel(str(desc) if desc else "—")
+        desc_label.setWordWrap(True)
+        desc_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        card_layout.addWidget(_bold("Description:"), 1, 0)
+        card_layout.addWidget(desc_label, 1, 1, 1, 5)
+
+        # Group info
+        from core.hcpcs_groups import get_group_for_code
+        group_info = get_group_for_code(hcpcs)
+        if group_info:
+            prefix, short_name, _group_desc = group_info
+            card_layout.addWidget(_bold("Group:"), 2, 0)
+            card_layout.addWidget(_val(f"{prefix} — {short_name}"), 2, 1, 1, 5)
+
+        # ZIP / rural status
+        zip_text = self._zip5 if self._zip5 else "—"
+        card_layout.addWidget(_bold("ZIP:"), 3, 0)
+        card_layout.addWidget(_val(zip_text), 3, 1)
+
+        if self._zip5 and len(self._zip5) == 5 and self._zip5.isdigit():
+            # Show rural status for the most recent year with data (best proxy)
+            from core.database import get_available_years
+            avail = get_available_years()
+            rural_note = "—"
+            if avail:
+                rural = is_rural_zip(avail[0], self._zip5)
+                rural_note = f"{'Rural (R)' if rural else 'Non-Rural (NR)'} (as of {avail[0]})"
+            card_layout.addWidget(_bold("Rural Status:"), 3, 2)
+            card_layout.addWidget(_val(rural_note), 3, 3, 1, 3)
+        else:
+            card_layout.addWidget(_bold("Rural Status:"), 3, 2)
+            card_layout.addWidget(_val("No ZIP — defaulting to NR"), 3, 3, 1, 3)
+
+        layout.addWidget(card)
+
+        # ---- Fetch all historical records for this HCPCS/state ----
+        hist = get_fees(state_abbr=state, hcpcs_code=hcpcs)
+        if modifier:
+            hist = [r for r in hist if (r.get("modifier") or "") == modifier]
+        hist.sort(key=lambda r: r.get("year", 0), reverse=True)
+
+        # ---- Primary state section label ----
+        prim_label = QLabel(f"<b>State: {state}</b>")
+        prim_label.setStyleSheet("font-size: 13px; margin-top: 4px;")
+        layout.addWidget(prim_label)
+
+        # ---- Primary table ----
+        primary_table = self._build_primary_table(hist)
+        layout.addWidget(primary_table)
+
+        # ---- Comparison state section ----
+        comp_row = QHBoxLayout()
+        comp_row.addWidget(QLabel("Compare to state:"))
+        self._comp_combo = QComboBox()
+        self._comp_combo.setMinimumWidth(160)
+        self._comp_combo.addItem("— None —", None)
+        # Populate with all available states that have data for this HCPCS
+        from core.database import get_selected_states
+        for abbr, sname in get_selected_states():
+            if abbr != state:
+                self._comp_combo.addItem(f"{sname} ({abbr})", abbr)
+        comp_row.addWidget(self._comp_combo)
+        comp_row.addWidget(
+            QLabel("<small><i>Effective ($) not shown for comparison state "
+                   "(ZIP rural applies to primary state only)</i></small>")
+        )
+        comp_row.addStretch()
+        layout.addLayout(comp_row)
+
+        # Container for the comparison section (label + table)
+        self._comp_container = QWidget()
+        self._comp_layout = QVBoxLayout(self._comp_container)
+        self._comp_layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._comp_container)
+
+        self._hcpcs = hcpcs
+        self._modifier = modifier
+        self._comp_combo.currentIndexChanged.connect(self._update_comparison)
+
+        # ---- Close button ----
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+    # ---- Helpers ----
+
+    @staticmethod
+    def _fmt(val):
+        """Format a dollar amount or return '—' if None."""
+        if val is None:
+            return "—"
+        try:
+            return f"{float(val):,.2f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    def _build_primary_table(self, hist):
+        """Build the primary state table with Year, NR, R, Effective, Modifier, Source."""
+        columns = ["Year", "NR ($)", "R ($)", "Effective ($)", "Modifier", "Source"]
+        table = QTableWidget(len(hist), len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.horizontalHeader().setDefaultSectionSize(110)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        table.setSortingEnabled(False)
+
+        right_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+        for i, r in enumerate(hist):
+            year = r.get("year", 0)
+            nr = r.get("allowable_nr") or r.get("allowable")
+            rv = r.get("allowable_r")
+            # Effective: prefer R if rural for that year, else NR; fallback NR
+            rural = (
+                is_rural_zip(year, self._zip5)
+                if self._zip5 and len(self._zip5) == 5 and self._zip5.isdigit()
+                else False
+            )
+            if rural and rv is not None:
+                effective = rv
+            else:
+                effective = nr
+
+            row_data = [
+                (str(year), Qt.AlignmentFlag.AlignCenter),
+                (self._fmt(nr), right_align),
+                (self._fmt(rv), right_align),
+                (self._fmt(effective), right_align),
+                (r.get("modifier") or "—", Qt.AlignmentFlag.AlignCenter),
+                (r.get("data_source") or "—", Qt.AlignmentFlag.AlignLeft),
+            ]
+            for col_i, (val, align) in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(align)
+                table.setItem(i, col_i, item)
+
+        return table
+
+    def _build_comparison_table(self, hist_comp, comp_state):
+        """Build the comparison state table: Year, NR ($), R ($), Modifier, Source."""
+        columns = ["Year", "NR ($)", "R ($)", "Modifier", "Source"]
+        table = QTableWidget(len(hist_comp), len(columns))
+        table.setHorizontalHeaderLabels(columns)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.horizontalHeader().setDefaultSectionSize(110)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        table.setSortingEnabled(False)
+
+        right_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+
+        for i, r in enumerate(hist_comp):
+            year = r.get("year", 0)
+            nr = r.get("allowable_nr") or r.get("allowable")
+            rv = r.get("allowable_r")
+            row_data = [
+                (str(year), Qt.AlignmentFlag.AlignCenter),
+                (self._fmt(nr), right_align),
+                (self._fmt(rv), right_align),
+                (r.get("modifier") or "—", Qt.AlignmentFlag.AlignCenter),
+                (r.get("data_source") or "—", Qt.AlignmentFlag.AlignLeft),
+            ]
+            for col_i, (val, align) in enumerate(row_data):
+                item = QTableWidgetItem(val)
+                item.setTextAlignment(align)
+                table.setItem(i, col_i, item)
+        return table
+
+    def _update_comparison(self):
+        """Rebuild the comparison section when the combo selection changes."""
+        # Clear previous comparison widgets
+        while self._comp_layout.count():
+            item = self._comp_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        comp_state = self._comp_combo.currentData()
+        if not comp_state:
+            return
+
+        hist_comp = get_fees(state_abbr=comp_state, hcpcs_code=self._hcpcs)
+        if self._modifier:
+            hist_comp = [r for r in hist_comp if (r.get("modifier") or "") == self._modifier]
+        hist_comp.sort(key=lambda r: r.get("year", 0), reverse=True)
+
+        section_label = QLabel(f"<b>Comparison — State: {comp_state}</b>")
+        section_label.setStyleSheet(
+            "font-size: 13px; color: #003366; border-top: 1px solid #c0c8d8; padding-top: 6px;"
+        )
+        self._comp_layout.addWidget(section_label)
+
+        if hist_comp:
+            table = self._build_comparison_table(hist_comp, comp_state)
+            self._comp_layout.addWidget(table)
+        else:
+            self._comp_layout.addWidget(
+                QLabel(f"<i>No data available for {comp_state}.</i>")
+            )
+
+
+class _ImportLogDialog(QDialog):
+    """Shows the import history log."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Import Log")
+        self.setMinimumSize(700, 400)
+        layout = QVBoxLayout(self)
+
+        log = get_import_log()
+        table = QTableWidget(len(log), 5)
+        table.setHorizontalHeaderLabels(["File", "Source", "Records", "States", "Imported At"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+
+        for row_i, entry in enumerate(log):
+            table.setItem(row_i, 0, QTableWidgetItem(entry.get("file_name", "")))
+            table.setItem(row_i, 1, QTableWidgetItem(entry.get("source", "")))
+            table.setItem(row_i, 2, QTableWidgetItem(str(entry.get("record_count", ""))))
+            table.setItem(row_i, 3, QTableWidgetItem(entry.get("states", "")))
+            table.setItem(row_i, 4, QTableWidgetItem(entry.get("imported_at", "")))
+
+        layout.addWidget(table)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignmentFlag.AlignRight)

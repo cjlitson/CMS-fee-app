@@ -1,0 +1,11 @@
+HCPCS_CD,Mod,Long_description,Non_fac_total,Fac_total,Non_fac_limiting,Fac_limiting
+99201,,Office/outpatient visit new low complexity,76.00,55.00,110.00,79.00
+99202,,Office/outpatient visit new mod complexity,110.00,77.00,159.00,111.00
+99203,,Office/outpatient visit new mod complexity,165.00,113.00,239.00,163.00
+99211,,Office/outpatient visit est minimal,22.00,20.00,32.00,29.00
+99212,,Office/outpatient visit est low complexity,47.00,36.00,68.00,52.00
+99213,,Office/outpatient visit est mod complexity,85.50,62.00,123.00,89.00
+99214,,Office/outpatient visit est mod/high complexity,125.00,89.00,181.00,129.00
+99215,,Office/outpatient visit est high complexity,172.00,119.00,249.00,172.00
+71046,,Radiologic exam chest 2 views,40.00,40.00,58.00,58.00
+93000,,Electrocardiogram routine ecg,16.80,16.80,24.00,24.00
