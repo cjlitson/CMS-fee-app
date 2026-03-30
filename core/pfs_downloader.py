@@ -48,6 +48,9 @@ _PFS_ZIP_RE = _re.compile(
     r"(?i)(?:pfs|national.?payment|natlpay|natl.?pay|physician.?fee).*?\.zip$"
 )
 
+# CMS PFS National Payment Amount files are reliably available from 2024 onward.
+# Earlier years exist but were distributed in a different format/location.
+# Update the start year here if older data needs to be supported.
 SUPPORTED_YEARS = list(range(2024, date.today().year + 1))
 
 
