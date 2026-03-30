@@ -18,10 +18,24 @@ from core.database import (
     is_rural_zip, get_current_year_or_fallback,
 )
 from core.cms_downloader import download_cms_fees, SUPPORTED_YEARS
+from core.pfs_downloader import download_pfs_fees
+from core.pfs_downloader import SUPPORTED_YEARS as PFS_SUPPORTED_YEARS
+from core.database import (
+    get_pfs_fees, get_available_pfs_years, get_current_pfs_year_or_fallback,
+)
 from ui.import_dialog import ImportDialog
 from ui.export_dialog import ExportDialog
 from ui.state_selector_dialog import StateSelectorDialog
 from ui.year_selector_dialog import YearSelectorDialog
+
+# Column definitions for Physician Fee Schedule table
+_PFS_COLUMNS = [
+    "hcpcs_code", "description", "payment_non_facility",
+    "payment_facility", "year", "data_source",
+]
+_PFS_COLUMN_HEADERS = [
+    "HCPCS Code", "Description", "Non-Facility ($)", "Facility ($)", "Year", "Source",
+]
 
 
 def _asset(name: str) -> Path:
@@ -50,6 +64,29 @@ class SyncWorker(QThread):
                 count = download_cms_fees(
                     year,
                     self.states,
+                    progress_callback=lambda msg: self.progress.emit(msg),
+                )
+                total += count
+            self.finished.emit(total)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class PfsSyncWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(int)
+    error = pyqtSignal(str)
+
+    def __init__(self, years):
+        super().__init__()
+        self.years = years
+
+    def run(self):
+        try:
+            total = 0
+            for year in self.years:
+                count = download_pfs_fees(
+                    year,
                     progress_callback=lambda msg: self.progress.emit(msg),
                 )
                 total += count
@@ -147,6 +184,19 @@ class MainWindow(QMainWindow):
         self._update_bar_widget.hide()
         root.addWidget(self._update_bar_widget)
 
+        # ---- Schedule Type selector ----
+        schedule_row = QHBoxLayout()
+        schedule_row.setSpacing(6)
+        schedule_row.addWidget(QLabel("Schedule Type:"))
+        self.schedule_combo = QComboBox()
+        self.schedule_combo.addItem("DMEPOS HCPCS Fee Schedule", "dmepos")
+        self.schedule_combo.addItem("Physician Fee Schedule (National)", "pfs")
+        self.schedule_combo.setMinimumWidth(280)
+        self.schedule_combo.currentIndexChanged.connect(self._on_schedule_type_changed)
+        schedule_row.addWidget(self.schedule_combo)
+        schedule_row.addStretch()
+        root.addLayout(schedule_row)
+
         # ---- Toolbar (two rows) ----
         toolbar_container = QVBoxLayout()
         toolbar_container.setSpacing(4)
@@ -181,7 +231,8 @@ class MainWindow(QMainWindow):
         row1.addSpacing(8)
 
         # State filter
-        row1.addWidget(QLabel("State:"))
+        self._state_label = QLabel("State:")
+        row1.addWidget(self._state_label)
         self.state_combo = QComboBox()
         self.state_combo.setMinimumWidth(130)
         self.state_combo.currentIndexChanged.connect(self._apply_filters)
@@ -191,7 +242,8 @@ class MainWindow(QMainWindow):
         row1.addSpacing(8)
 
         # ZIP code input for rural/non-rural determination
-        row1.addWidget(QLabel("ZIP:"))
+        self._zip_label = QLabel("ZIP:")
+        row1.addWidget(self._zip_label)
         self.zip_edit = QLineEdit()
         self.zip_edit.setPlaceholderText("5-digit ZIP")
         self.zip_edit.setMaximumWidth(80)
@@ -215,7 +267,8 @@ class MainWindow(QMainWindow):
         row2.setSpacing(6)
 
         # HCPCS Group filter
-        row2.addWidget(QLabel("Group:"))
+        self._group_label = QLabel("Group:")
+        row2.addWidget(self._group_label)
         self.group_combo = QComboBox()
         self.group_combo.setMinimumWidth(220)
         self.group_combo.addItem("All Groups", None)
@@ -391,11 +444,14 @@ class MainWindow(QMainWindow):
         prev_year = self.year_combo.currentData()
         self.year_combo.clear()
         self.year_combo.addItem("All Years", None)
-        for y in get_available_years():
-            self.year_combo.addItem(str(y), y)
-
-        # Default to current year (or most recent year present in DB)
-        target_year = get_current_year_or_fallback()
+        if self._is_pfs_mode():
+            for y in get_available_pfs_years():
+                self.year_combo.addItem(str(y), y)
+            target_year = get_current_pfs_year_or_fallback()
+        else:
+            for y in get_available_years():
+                self.year_combo.addItem(str(y), y)
+            target_year = get_current_year_or_fallback()
         if target_year is not None:
             idx = self.year_combo.findData(target_year)
             if idx >= 0:
@@ -490,6 +546,38 @@ class MainWindow(QMainWindow):
         self._save_filter_preferences()
         self._on_zip_changed(self.zip_edit.text())
 
+    def _on_schedule_type_changed(self):
+        """Show/hide DMEPOS-specific controls when schedule type changes."""
+        is_pfs = self._is_pfs_mode()
+        self.state_combo.setVisible(not is_pfs)
+        self._state_label.setVisible(not is_pfs)
+        self.zip_edit.setVisible(not is_pfs)
+        self._zip_label.setVisible(not is_pfs)
+        self.rural_label.setVisible(not is_pfs)
+        if hasattr(self, "group_combo"):
+            self.group_combo.setVisible(not is_pfs)
+            self._group_label.setVisible(not is_pfs)
+        if is_pfs:
+            self.table.setColumnCount(6)
+            self.table.setHorizontalHeaderLabels(_PFS_COLUMN_HEADERS)
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setDefaultSectionSize(120)
+        else:
+            self.table.setColumnCount(7)
+            self.table.setHorizontalHeaderLabels([
+                "HCPCS Code", "Description", "State", "Year",
+                "Allowable ($)", "Modifier", "Source",
+            ])
+            self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            self.table.horizontalHeader().setDefaultSectionSize(100)
+        self._refresh_filters()
+        self._apply_filters()
+        set_preference("schedule_type", self.schedule_combo.currentData())
+
+    def _is_pfs_mode(self):
+        """Return True if Physician Fee Schedule mode is selected."""
+        return hasattr(self, "schedule_combo") and self.schedule_combo.currentData() == "pfs"
+
     def _sync_rural_label(self):
         """Update the rural/non-rural label to match the current ZIP field.
 
@@ -521,7 +609,7 @@ class MainWindow(QMainWindow):
             self._apply_filters()
 
     def _query_year(self):
-        """Return the year to pass to get_fees().
+        """Return the year to pass to the query.
 
         "All Years" with no specific year selected shows current (or fallback) year only.
         """
@@ -529,6 +617,8 @@ class MainWindow(QMainWindow):
         if y is not None:
             return y
         # "All Years" → show current year only (or fallback)
+        if self._is_pfs_mode():
+            return get_current_pfs_year_or_fallback()
         return get_current_year_or_fallback()
 
     def _on_search_text_changed(self):
@@ -537,18 +627,25 @@ class MainWindow(QMainWindow):
 
     def _apply_filters(self):
         year = self._query_year()
-        state = self.state_combo.currentData()
         code = self.code_edit.text().strip() or None
         keyword = self.keyword_edit.text().strip() or None
-        group = self.group_combo.currentData() if hasattr(self, "group_combo") else None
 
-        self._records = get_fees(
-            state_abbr=state,
-            year=year,
-            hcpcs_code=code,
-            keyword=keyword,
-            hcpcs_group=group,
-        )
+        if self._is_pfs_mode():
+            self._records = get_pfs_fees(
+                year=year,
+                hcpcs_code=code,
+                keyword=keyword,
+            )
+        else:
+            state = self.state_combo.currentData()
+            group = self.group_combo.currentData() if hasattr(self, "group_combo") else None
+            self._records = get_fees(
+                state_abbr=state,
+                year=year,
+                hcpcs_code=code,
+                keyword=keyword,
+                hcpcs_group=group,
+            )
         self._populate_table(self._records)
         self._set_status(f"{len(self._records):,} records found.")
         self._save_filter_preferences()
@@ -629,10 +726,40 @@ class MainWindow(QMainWindow):
             # Refresh derived labels now that all values are in place.
             self._update_year_view_label()
             self._sync_rural_label()
+
+            # Restore schedule type
+            saved_schedule = get_preference("schedule_type", "dmepos")
+            if saved_schedule and hasattr(self, "schedule_combo"):
+                idx = self.schedule_combo.findData(saved_schedule)
+                if idx >= 0:
+                    self.schedule_combo.blockSignals(True)
+                    self.schedule_combo.setCurrentIndex(idx)
+                    self.schedule_combo.blockSignals(False)
+                    is_pfs = saved_schedule == "pfs"
+                    self.state_combo.setVisible(not is_pfs)
+                    self.zip_edit.setVisible(not is_pfs)
+                    self.rural_label.setVisible(not is_pfs)
+                    if hasattr(self, "group_combo"):
+                        self.group_combo.setVisible(not is_pfs)
+                    if is_pfs:
+                        self.table.setColumnCount(6)
+                        self.table.setHorizontalHeaderLabels(_PFS_COLUMN_HEADERS)
+                    else:
+                        self.table.setColumnCount(7)
+                        self.table.setHorizontalHeaderLabels([
+                            "HCPCS Code", "Description", "State", "Year",
+                            "Allowable ($)", "Modifier", "Source",
+                        ])
         except Exception:
             pass  # Preference restore is best-effort
 
     def _populate_table(self, records):
+        if self._is_pfs_mode():
+            self._populate_pfs_table(records)
+        else:
+            self._populate_dmepos_table(records)
+
+    def _populate_dmepos_table(self, records):
         is_rural = self._is_rural()
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(records))
@@ -658,13 +785,41 @@ class MainWindow(QMainWindow):
             for col_i, v in enumerate(values):
                 item = QTableWidgetItem(str(v))
                 if col_i == 0:
-                    # Style as hyperlink; store original record index for click handling
                     item.setForeground(link_color)
                     item.setFont(link_font)
                     item.setToolTip("Click to view history for this HCPCS code")
                     item.setData(Qt.ItemDataRole.UserRole, row_i)
                 if col_i == 4 and chosen is None:
                     item.setForeground(Qt.GlobalColor.darkGray)
+                self.table.setItem(row_i, col_i, item)
+        self.table.setSortingEnabled(True)
+
+    def _populate_pfs_table(self, records):
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(records))
+        link_color = QColor("#0066CC")
+        link_font = QFont()
+        link_font.setUnderline(True)
+        right_align = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        for row_i, r in enumerate(records):
+            nf = r.get("payment_non_facility")
+            f = r.get("payment_facility")
+            values = [
+                (r.get("hcpcs_code", ""), Qt.AlignmentFlag.AlignLeft),
+                (r.get("description", ""), Qt.AlignmentFlag.AlignLeft),
+                ("—" if nf is None else f"{nf:,.2f}", right_align),
+                ("—" if f is None else f"{f:,.2f}", right_align),
+                (str(r.get("year", "")), Qt.AlignmentFlag.AlignCenter),
+                (r.get("data_source", "") or "", Qt.AlignmentFlag.AlignLeft),
+            ]
+            for col_i, (v, align) in enumerate(values):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(align)
+                if col_i == 0:
+                    item.setForeground(link_color)
+                    item.setFont(link_font)
+                    item.setToolTip("Click to view PFS history for this code")
+                    item.setData(Qt.ItemDataRole.UserRole, row_i)
                 self.table.setItem(row_i, col_i, item)
         self.table.setSortingEnabled(True)
 
@@ -681,6 +836,8 @@ class MainWindow(QMainWindow):
 
     def _open_history_for_row(self, row):
         """Open the history dialog for the given table row."""
+        if self._is_pfs_mode():
+            return  # PFS mode: no history dialog
         first_item = self.table.item(row, 0)
         if first_item is None:
             return
@@ -738,8 +895,16 @@ class MainWindow(QMainWindow):
         if not self._records:
             QMessageBox.information(self, "No Data", "No records to export. Apply filters first.")
             return
-        zip_code = self.zip_edit.text().strip()
-        dlg = ExportDialog(self._records, self, is_rural=self._is_rural(), zip_code=zip_code)
+        if self._is_pfs_mode():
+            dlg = ExportDialog(
+                self._records, self,
+                is_rural=False, zip_code="",
+                columns=_PFS_COLUMNS,
+                column_headers=_PFS_COLUMN_HEADERS,
+            )
+        else:
+            zip_code = self.zip_edit.text().strip()
+            dlg = ExportDialog(self._records, self, is_rural=self._is_rural(), zip_code=zip_code)
         dlg.exec()
 
     def _manage_states(self):
@@ -811,6 +976,9 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _sync_cms(self):
+        if self._is_pfs_mode():
+            self._sync_pfs()
+            return
         selected = get_selected_states()
         if not selected:
             QMessageBox.warning(
@@ -880,6 +1048,52 @@ class MainWindow(QMainWindow):
             self._progress_dlg = None
         self._set_status("Sync failed.")
         QMessageBox.critical(self, "Sync Error", msg)
+
+    def _sync_pfs(self):
+        """Trigger PFS national payment amount sync."""
+        dlg = _SyncPfsYearsDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        years = dlg.selected_years()
+        if not years:
+            return
+
+        self._progress_dlg = QProgressDialog("Starting PFS sync…", None, 0, 0, self)
+        self._progress_dlg.setWindowTitle("Syncing PFS from CMS")
+        self._progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._progress_dlg.setMinimumWidth(500)
+        self._progress_dlg.setMinimumDuration(0)
+        self._progress_dlg.setValue(0)
+        geo = self.geometry()
+        dlg_w, dlg_h = 500, 120
+        self._progress_dlg.setGeometry(
+            geo.x() + (geo.width() - dlg_w) // 2,
+            geo.y() + (geo.height() - dlg_h) // 2,
+            dlg_w, dlg_h,
+        )
+        self._progress_dlg.show()
+        self._progress_dlg.raise_()
+        self._progress_dlg.activateWindow()
+
+        self._set_status("Syncing PFS from CMS…")
+        self._sync_worker = PfsSyncWorker(years)
+        self._sync_worker.progress.connect(self._on_sync_progress)
+        self._sync_worker.finished.connect(self._on_pfs_sync_done)
+        self._sync_worker.error.connect(self._on_sync_error)
+        self._sync_worker.start()
+
+    def _on_pfs_sync_done(self, count):
+        if self._progress_dlg:
+            self._progress_dlg.close()
+            self._progress_dlg = None
+        self._refresh_filters()
+        self._apply_filters()
+        self._set_status(f"PFS sync complete — {count:,} records imported.")
+        QMessageBox.information(
+            self, "PFS Sync Complete",
+            f"Successfully imported {count:,} PFS records from CMS.",
+        )
 
     def _show_import_log(self):
         dlg = _ImportLogDialog(self)
@@ -1111,6 +1325,48 @@ class _SyncYearsDialog(QDialog):
         defaults = saved_years if saved_years else get_default_selected_years()
         for year, cb in self._checks.items():
             cb.setChecked(year in defaults)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        sync_btn = QPushButton("Sync")
+        sync_btn.setStyleSheet(
+            "background-color: #003366; color: white; padding: 6px 16px; font-weight: bold;"
+        )
+        cancel_btn.clicked.connect(self.reject)
+        sync_btn.clicked.connect(self.accept)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(sync_btn)
+        layout.addLayout(btn_row)
+
+    def selected_years(self):
+        return [y for y, cb in self._checks.items() if cb.isChecked()]
+
+
+class _SyncPfsYearsDialog(QDialog):
+    """Simple dialog to pick which year(s) to sync for PFS."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sync PFS from CMS")
+        self.setMinimumWidth(340)
+        self._checks = {}
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel(
+            "Download CMS Physician Fee Schedule\n"
+            "National Payment Amount file.\n"
+            "\nSelect year(s) to download:"
+        ))
+
+        for year in PFS_SUPPORTED_YEARS:
+            cb = QCheckBox(str(year))
+            layout.addWidget(cb)
+            self._checks[year] = cb
+
+        current = date.today().year
+        for year, cb in self._checks.items():
+            cb.setChecked(year == current)
 
         btn_row = QHBoxLayout()
         cancel_btn = QPushButton("Cancel")
