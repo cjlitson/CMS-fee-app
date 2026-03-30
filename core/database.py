@@ -106,9 +106,24 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hcpcs_code ON hcpcs_fees(hcpcs_code)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_year_state ON hcpcs_fees(year, state_abbr)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rural_zips ON rural_zips(year, zip5)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pfs_fees (
+                id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                year                 INTEGER NOT NULL,
+                hcpcs_code           TEXT NOT NULL,
+                description          TEXT,
+                payment_non_facility REAL,
+                payment_facility     REAL,
+                data_source          TEXT,
+                imported_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pfs_hcpcs_code ON pfs_fees(hcpcs_code)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pfs_year ON pfs_fees(year)")
 
         # Lightweight migration: add new columns to hcpcs_fees if they don't exist
         _migrate_hcpcs_fees(conn)
+        _migrate_pfs_fees(conn)
     conn.close()
 
 
@@ -121,6 +136,24 @@ def _migrate_hcpcs_fees(conn):
     for col, coltype in (("allowable_nr", "REAL"), ("allowable_r", "REAL")):
         if col not in existing:
             conn.execute(f"ALTER TABLE hcpcs_fees ADD COLUMN {col} {coltype}")
+
+
+def _migrate_pfs_fees(conn):
+    """Create pfs_fees table if it doesn't already exist (for existing installs)."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS pfs_fees (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            year                 INTEGER NOT NULL,
+            hcpcs_code           TEXT NOT NULL,
+            description          TEXT,
+            payment_non_facility REAL,
+            payment_facility     REAL,
+            data_source          TEXT,
+            imported_at          DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pfs_hcpcs_code ON pfs_fees(hcpcs_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pfs_year ON pfs_fees(year)")
 
 
 def get_selected_states():
@@ -408,3 +441,95 @@ def get_available_hcpcs_prefixes():
         return {r["prefix"] for r in rows}
     finally:
         conn.close()
+
+
+def insert_pfs_fees(records, data_source="pfs_download"):
+    """Bulk-insert PFS fee records.
+
+    Each record is a dict with keys:
+      year, hcpcs_code, description, payment_non_facility, payment_facility.
+    """
+    if not records:
+        return
+    conn = _get_conn()
+    with conn:
+        conn.executemany(
+            """
+            INSERT INTO pfs_fees
+                (year, hcpcs_code, description, payment_non_facility,
+                 payment_facility, data_source)
+            VALUES
+                (:year, :hcpcs_code, :description, :payment_non_facility,
+                 :payment_facility, :data_source)
+            """,
+            [
+                {
+                    "year": r.get("year"),
+                    "hcpcs_code": r.get("hcpcs_code", ""),
+                    "description": r.get("description", ""),
+                    "payment_non_facility": r.get("payment_non_facility"),
+                    "payment_facility": r.get("payment_facility"),
+                    "data_source": r.get("data_source", data_source),
+                }
+                for r in records
+            ],
+        )
+    conn.close()
+
+
+def delete_pfs_fees_by_year_source(year, data_source="pfs_download"):
+    """Delete all PFS fee records matching the given year and data_source.
+
+    Used for "replace" semantics during re-sync.
+    """
+    conn = _get_conn()
+    with conn:
+        conn.execute(
+            "DELETE FROM pfs_fees WHERE year = ? AND data_source = ?",
+            (year, data_source),
+        )
+    conn.close()
+
+
+def get_pfs_fees(year=None, hcpcs_code=None, keyword=None):
+    """Query PFS fee records with optional filters. Returns list of dicts."""
+    query = "SELECT * FROM pfs_fees WHERE 1=1"
+    params = []
+    if year:
+        query += " AND year = ?"
+        params.append(year)
+    if hcpcs_code:
+        query += " AND hcpcs_code LIKE ?"
+        params.append(f"%{hcpcs_code.upper()}%")
+    if keyword:
+        query += " AND description LIKE ?"
+        params.append(f"%{keyword}%")
+    query += " ORDER BY hcpcs_code, year"
+    conn = _get_conn()
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_available_pfs_years():
+    """Return sorted list of years present in pfs_fees."""
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT DISTINCT year FROM pfs_fees ORDER BY year DESC"
+    ).fetchall()
+    conn.close()
+    return [r["year"] for r in rows]
+
+
+def get_current_pfs_year_or_fallback():
+    """Return the current calendar year if it has PFS data, else the most recent year with data.
+
+    Returns None if the database has no PFS data at all.
+    """
+    current = date.today().year
+    available = get_available_pfs_years()
+    if not available:
+        return None
+    if current in available:
+        return current
+    return available[0]
